@@ -27,7 +27,7 @@ router.get(
 router.get(
   '/all',
   protect,
-  requirePatient,
+  requireAnyUser,
   bookingController.getAllAppointments
 );
 
