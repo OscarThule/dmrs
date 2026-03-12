@@ -200,8 +200,9 @@ dayOnly.setHours(0,0,0,0);
     }
 
     // ================= PRICING LOGIC (DEPOSIT ONLY) =================
-const paymentSettings = medicalCenter.paymentSettings;
+const paymentSettings = medicalCenter.paymentSettings || {};
 
+const consultationFee = Number(paymentSettings?.consultationFee || 0);
 const depositAmount = Number(paymentSettings?.bookingDeposit || 0);
 
 if (!depositAmount || depositAmount <= 0) {
@@ -217,7 +218,6 @@ const platformFee = Math.max(50, tenPercent);
 
 // User only pays deposit + platform fee
 const totalAmount = depositAmount + platformFee;
-
 
     // ================= HOLD SLOT (ATOMIC) =================
 const holdResult = await RollingSchedule.updateOne(
@@ -274,10 +274,18 @@ if (holdResult.modifiedCount === 0) {
       status: "pending",
       payment_status: "pending",
       is_paid: false,
-      appointment_duration: slot.duration || 30,
+           appointment_duration: slot.duration || 30,
       is_shifted_slot: isShiftedSlot,
       shift_notes: isShiftedSlot ? "Shifted from original slot" : "",
-      payment_reference: null
+      payment_reference: null,
+
+      consultation_fee: consultationFee,
+      deposit_amount: depositAmount,
+      platform_fee: platformFee,
+      total_amount: totalAmount,
+      currency: "ZAR",
+      payment_required: true,
+      payment_amount_paid: 0
     });
 
     const paymentReference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
@@ -334,7 +342,7 @@ if (!subaccountCode) {
 await Promise.all([
       appointment.save(),
       payment.save(),
-      schedule.save()
+      
     ]);
 
     return res.status(201).json({
@@ -398,12 +406,11 @@ const confirmAppointmentPayment = async (reference) => {
     };
 
     // Update appointment
-    appointment.status = "confirmed";
+appointment.status = "confirmed";
 appointment.payment_status = "success";
 appointment.is_paid = true;
 appointment.payment_reference = reference;
-
-
+appointment.payment_amount_paid = payment.amount || appointment.total_amount || 0;
     await payment.save();
     await appointment.save();
   } catch (err) {
@@ -536,17 +543,25 @@ const getAppointmentPaymentStatus = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
-        appointment_status: appointment.status,
-        payment_status: appointment.payment_status,
-        payment_reference: appointment.payment_reference,
-        is_paid: appointment.is_paid,
-        payment_details: payment ? {
-          amount: payment.amount,
-          currency: payment.currency,
-          status: payment.status,
-          created_at: payment.createdAt
-        } : null
-      }
+  appointment_status: appointment.status,
+  payment_status: appointment.payment_status,
+  payment_reference: appointment.payment_reference,
+  is_paid: appointment.is_paid,
+  pricing: {
+    consultation_fee: appointment.consultation_fee,
+    deposit_amount: appointment.deposit_amount,
+    platform_fee: appointment.platform_fee,
+    total_amount: appointment.total_amount,
+    payment_amount_paid: appointment.payment_amount_paid,
+    currency: appointment.currency
+  },
+  payment_details: payment ? {
+    amount: payment.amount,
+    currency: payment.currency,
+    status: payment.status,
+    created_at: payment.createdAt
+  } : null
+}
     });
 
   } catch (error) {
