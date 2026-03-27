@@ -1451,46 +1451,6 @@ exports.createPayment = async (req, res) => {
   }
 };
 
-exports.verifyPaymentController = async (req, res) => {
-  try {
-    const { reference } = req.params;
-
-    const result = await verifyPayment(reference);
-
-    if (!result.success) {
-      return res.status(200).json(result);
-    }
-
-    if (result.data?.status === "success") {
-      const payment = await Payment.findOne({ reference });
-
-      if (payment && payment.status !== "success") {
-        payment.status = "success";
-        await payment.save();
-      }
-
-      if (payment) {
-        const appointment = await Appointment.findById(payment.appointment_id);
-
-        if (appointment && appointment.status === "pending") {
-          appointment.status = "confirmed";
-          appointment.payment_status = "success";
-          appointment.is_paid = true;
-          appointment.payment_reference = reference;
-          await appointment.save();
-        }
-      }
-    }
-
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Verify controller error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Verification failed",
-    });
-  }
-};
 
 
 module.exports = {
