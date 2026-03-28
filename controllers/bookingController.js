@@ -338,7 +338,7 @@ const createPendingAppointment = async (req, res) => {
         "dailySchedules.timeSlots.availableCapacity": { $gt: 0 },
         // Additional filter for doctor capacity (must be less than max)
         "dailySchedules.timeSlots.assignedDoctors.doctorId": practitioner_id,
-        "dailySchedules.timeSlots.assignedDoctors.currentPatients": { $lt: mongoose.Types.Decimal128 ? mongoose.Types.Decimal128(doctorAssignment.maxPatients) : doctorAssignment.maxPatients }
+        "dailySchedules.timeSlots.assignedDoctors.currentPatients": { $lt: doctorAssignment.maxPatients }
       };
 
       const updateInc = {
