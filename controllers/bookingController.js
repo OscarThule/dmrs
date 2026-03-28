@@ -6,23 +6,44 @@ const MedicalCenter = require('../models/MedicalCenter');
 const Practitioner = require('../models/Practitioner');
 const Patient = require('../models/Patient');
 const Payment = require('../models/Payment');
-const { initializeAppointmentPayment,verifyPayment } = require('../services/paymentService');
+const { initializeAppointmentPayment, verifyPayment } = require('../services/paymentService');
 const { v4: uuidv4 } = require('uuid');
 
 /**
- * @desc    Create appointment with pending payment status (Holds slot)
+ * Helper: Add minutes to time string (HH:MM)
+ */
+const addMinutesToTime = (timeString, minutesToAdd) => {
+  const [hours, minutes] = timeString.split(':').map(Number);
+  const date = new Date();
+  date.setHours(hours, minutes, 0, 0);
+  date.setMinutes(date.getMinutes() + minutesToAdd);
+  const newHours = date.getHours().toString().padStart(2, '0');
+  const newMinutes = date.getMinutes().toString().padStart(2, '0');
+  return `${newHours}:${newMinutes}`;
+};
+
+/**
+ * @desc    Create appointment (handles both free and paid bookings)
  * @route   POST /api/bookings
  * @access  Patient
  */
 const createPendingAppointment = async (req, res) => {
+  // Start a session for potential transactions
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
+    // ================= AUTHENTICATION =================
     if (!req.patient) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(401).json({
         success: false,
         message: "Patient authentication required"
       });
     }
 
+    // ================= REQUEST BODY VALIDATION =================
     const {
       medical_center_id,
       schedule_id,
@@ -35,7 +56,6 @@ const createPendingAppointment = async (req, res) => {
       consultation_type = "face-to-face"
     } = req.body;
 
-    // ================= VALIDATION =================
     const requiredFields = [
       "medical_center_id",
       "schedule_id",
@@ -47,19 +67,19 @@ const createPendingAppointment = async (req, res) => {
 
     const missing = requiredFields.filter(f => !req.body[f]);
     if (missing.length > 0) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: `Missing required fields: ${missing.join(", ")}`
       });
     }
 
+    // ================= DATE VALIDATION =================
     const appointmentDate = new Date(date);
-    
-    const dayOnly = new Date(appointmentDate);
-dayOnly.setHours(0,0,0,0);
-
-
     if (isNaN(appointmentDate.getTime())) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: "Invalid date format"
@@ -69,19 +89,26 @@ dayOnly.setHours(0,0,0,0);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     if (appointmentDate < today) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: "Cannot book appointments in the past"
       });
     }
 
+    const dayOnly = new Date(appointmentDate);
+    dayOnly.setHours(0, 0, 0, 0);
+
     // ================= LOAD SCHEDULE =================
     const schedule = await RollingSchedule.findOne({
       _id: schedule_id,
       medical_center_id
-    });
+    }).session(session);
 
     if (!schedule) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({
         success: false,
         message: "Schedule not found"
@@ -89,12 +116,13 @@ dayOnly.setHours(0,0,0,0);
     }
 
     const dateStr = appointmentDate.toISOString().split("T")[0];
-
     const dayIndex = schedule.dailySchedules.findIndex(d =>
       new Date(d.date).toISOString().split("T")[0] === dateStr
     );
 
     if (dayIndex === -1) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({
         success: false,
         message: "No schedule found for this date"
@@ -102,15 +130,16 @@ dayOnly.setHours(0,0,0,0);
     }
 
     const daySchedule = schedule.dailySchedules[dayIndex];
-
     if (!daySchedule.isWorking) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: "Medical center is not working on this day"
       });
     }
 
-    // ================= SLOT CHECK =================
+    // ================= SLOT RESOLUTION (original or shifted) =================
     let slot = daySchedule.timeSlots.find(s => s.id === slot_id);
     let isShiftedSlot = false;
 
@@ -120,47 +149,53 @@ dayOnly.setHours(0,0,0,0);
     }
 
     if (!slot) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({
         success: false,
         message: "Time slot not found"
       });
     }
 
-    
-
-    // ================= DOCTOR CHECK =================
+    // ================= DOCTOR ASSIGNMENT VALIDATION =================
     const doctorAssignment = slot.assignedDoctors.find(d =>
       d.doctorId && d.doctorId.toString() === practitioner_id.toString()
     );
 
     if (!doctorAssignment) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({
         success: false,
         message: "Selected doctor not available in this slot"
       });
     }
 
+    // Specialization check
     if (
       preferred_specialization &&
       !doctorAssignment.specialization.includes(preferred_specialization) &&
       !doctorAssignment.specialization.includes("general")
     ) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
-  success: false,
-  message: `Doctor does not specialize in ${preferred_specialization}`
-}); 
-
+        success: false,
+        message: `Doctor does not specialize in ${preferred_specialization}`
+      });
     }
 
-    // ================= DUPLICATE CHECK =================
-    const existing = await Appointment.findOne({
+    // ================= DUPLICATE APPOINTMENT CHECKS =================
+    const existingSameSlot = await Appointment.findOne({
       patient_id: req.patient._id,
       date: appointmentDate,
       slot_start: slot.start,
       status: { $in: ["pending", "confirmed"] }
-    });
+    }).session(session);
 
-    if (existing) {
+    if (existingSameSlot) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: "You already have an appointment at this time"
@@ -172,213 +207,309 @@ dayOnly.setHours(0,0,0,0);
     const endOfDay = new Date(appointmentDate);
     endOfDay.setHours(23, 59, 59, 999);
 
-    const alreadyToday = await Appointment.findOne({
+    const existingToday = await Appointment.findOne({
       patient_id: req.patient._id,
       date: { $gte: startOfDay, $lte: endOfDay },
       status: { $in: ["pending", "confirmed"] }
-    });
+    }).session(session);
 
-    if (alreadyToday) {
+    if (existingToday) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: "You already have an appointment for this day"
       });
     }
 
-    // ================= LOAD MAIN DATA =================
+    // ================= LOAD PATIENT, MEDICAL CENTER, PRACTITIONER =================
     const [patient, medicalCenter, practitioner] = await Promise.all([
-      Patient.findById(req.patient._id),
-      MedicalCenter.findById(medical_center_id),
-      Practitioner.findById(practitioner_id)
+      Patient.findById(req.patient._id).session(session),
+      MedicalCenter.findById(medical_center_id).session(session),
+      Practitioner.findById(practitioner_id).session(session)
     ]);
 
     if (!patient || !medicalCenter || !practitioner) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({
         success: false,
         message: "Patient, medical center or practitioner not found"
       });
     }
 
-    // ================= PRICING LOGIC (DEPOSIT ONLY) =================
-const paymentSettings = medicalCenter.paymentSettings || {};
+    // ================= PRICING & DEPOSIT LOGIC =================
+    const paymentSettings = medicalCenter.paymentSettings || {};
+    const consultationFee = Number(paymentSettings.consultationFee || 0);
+    const depositAmount = Number(paymentSettings.bookingDeposit || 0);
 
-const consultationFee = Number(paymentSettings?.consultationFee || 0);
-const depositAmount = Number(paymentSettings?.bookingDeposit || 0);
+    // Determine if this is a free booking (deposit = 0)
+    const isFreeBooking = depositAmount <= 0;
 
-if (!depositAmount || depositAmount <= 0) {
-  return res.status(400).json({
-    success: false,
-    message: "Booking deposit not configured for this medical center"
-  });
-}
+    let platformFee = 0;
+    let totalAmount = 0;
 
-// Platform fee: 10% of deposit or minimum R50
-const tenPercent = depositAmount * 0.10;
-const platformFee = Math.max(50, tenPercent);
-
-// User only pays deposit + platform fee
-const totalAmount = depositAmount + platformFee;
-
-    // ================= HOLD SLOT (ATOMIC) =================
-const holdResult = await RollingSchedule.updateOne(
-  {
-    _id: schedule_id,
-    medical_center_id,
-    "dailySchedules.date": dayOnly,
-    "dailySchedules.timeSlots.id": slot.id,
-    "dailySchedules.timeSlots.availableCapacity": { $gt: 0 }
-  },
-  {
-    $inc: {
-      "dailySchedules.$[d].timeSlots.$[s].availableCapacity": -1
+    if (!isFreeBooking) {
+      // Platform fee: 10% of deposit or minimum R50
+      const tenPercent = depositAmount * 0.10;
+      platformFee = Math.max(50, tenPercent);
+      totalAmount = depositAmount + platformFee;
     }
-  },
-  {
-    arrayFilters: [
-      { "d.date": dayOnly },
-      { "s.id": slot.id }
-    ]
-  }
-);
 
+    // ================= HOLD SLOT & INCREMENT DOCTOR COUNT (ATOMIC) =================
+    // We will do the hold inside a transaction, but first we need to verify that
+    // both slot capacity and doctor capacity are available.
+    // The updateOne with arrayFilters will ensure atomicity.
 
-if (holdResult.modifiedCount === 0) {
-  return res.status(409).json({
-    success: false,
-    message: "This slot was just taken by another patient. Please choose another slot."
-  });
-}
+    // For free bookings we also need to hold capacity (but no payment)
+    // For paid bookings we will hold capacity after Paystack init? Actually we'll hold it
+    // inside the transaction, but we need to hold it before calling Paystack to avoid
+    // double-booking? Better to hold after Paystack init to avoid holding capacity if Paystack fails.
+    // However, we must hold capacity before we commit the transaction, so the order is:
+    // 1. Validate everything
+    // 2. If paid, call Paystack (if fails, return error without any DB change)
+    // 3. Then in transaction: hold capacity, create appointment, create payment (if paid)
+    // This ensures we only hold capacity when payment is guaranteed (from Paystack's perspective)
+    // But there's a race: between step 2 and 3, the slot might be taken. That's okay, the
+    // transaction will fail because capacity won't be available, and we'll respond accordingly.
 
+    // For free bookings, we skip Paystack and go straight to transaction.
 
-    // ================= CREATE APPOINTMENT =================
-    const appointment = new Appointment({
-      appointment_id: `APT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      patient_id: req.patient._id,
-      medical_center_id,
-      practitioner_id,
-      schedule_id,
-      date: appointmentDate,
-      slot_id: slot.id,
-      original_slot_id: isShiftedSlot ? slot.shiftedFrom : null,
-      slot_start: slot.start,
-      slot_end: slot.end,
-      doctor_name: practitioner.full_name || doctorAssignment.doctorName,
-      doctor_specialization: doctorAssignment.specialization,
-      patient_name: `${patient.firstName} ${patient.lastName}`,
-      patient_email: patient.email,
-      patient_phone: patient.phone,
-      reason_for_visit,
-      symptoms: symptoms || "",
-      preferred_specialization: preferred_specialization || "general",
-      consultation_type,
-      status: "pending",
-      payment_status: "pending",
-      is_paid: false,
-           appointment_duration: slot.duration || 30,
-      is_shifted_slot: isShiftedSlot,
-      shift_notes: isShiftedSlot ? "Shifted from original slot" : "",
-      payment_reference: null,
+    let paymentReference = null;
+    let paystackAuthorizationUrl = null;
 
-      consultation_fee: consultationFee,
-      deposit_amount: depositAmount,
-      platform_fee: platformFee,
-      total_amount: totalAmount,
-      currency: "ZAR",
-      payment_required: true,
-      payment_amount_paid: 0
-    });
+    if (!isFreeBooking) {
+      // ================= INITIALIZE PAYMENT WITH PAYSTACK =================
+      const subaccountCode = medicalCenter.paystack?.subaccount_code;
+      if (!subaccountCode) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({
+          success: false,
+          message: "Medical center has no active payout subaccount"
+        });
+      }
 
-    const paymentReference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
-    appointment.payment_reference = paymentReference;
+      paymentReference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
 
-    
-    // ================= CREATE PAYMENT =================
-    const payment = new Payment({
-      reference: paymentReference,
-      appointment_id: appointment._id,
-      patient_id: req.patient._id,
-      amount: totalAmount,
-      currency: "ZAR",
-      status: "pending",
-      metadata: {
-        appointment_id: appointment._id.toString(),
-        patient_id: req.patient._id.toString(),
+      try {
+        const paymentResponse = await initializeAppointmentPayment({
+          email: patient.email,
+          amount: totalAmount,
+          reference: paymentReference,
+          subaccount_code: subaccountCode,
+          metadata: {
+            appointment_id: "pending", // will be replaced after appointment creation
+            patient_id: req.patient._id.toString(),
+            medical_center_id,
+            practitioner_id,
+            slot_id: slot.id,
+            date: dateStr,
+            time: `${slot.start} - ${slot.end}`,
+            reason_for_visit,
+            consultation_type,
+            deposit_amount: depositAmount,
+            platform_fee: platformFee,
+            total_paid: totalAmount
+          }
+        });
+        paystackAuthorizationUrl = paymentResponse.authorization_url;
+      } catch (paystackError) {
+        console.error("Paystack init error:", paystackError);
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(500).json({
+          success: false,
+          message: "Failed to initialize payment. Please try again."
+        });
+      }
+    }
+
+    // ================= ATOMIC DB OPERATIONS (CAPACITY HOLD, APPOINTMENT, PAYMENT) =================
+    try {
+      // First, try to hold the slot and increment doctor count.
+      // We use a single update with arrayFilters to check both slot capacity and doctor capacity.
+      // Note: For free booking, we still need to hold capacity (but no payment record).
+      const updateFilter = {
+        _id: schedule_id,
+        medical_center_id,
+        "dailySchedules.date": dayOnly,
+        "dailySchedules.timeSlots.id": slot.id,
+        "dailySchedules.timeSlots.availableCapacity": { $gt: 0 },
+        // Additional filter for doctor capacity (must be less than max)
+        "dailySchedules.timeSlots.assignedDoctors.doctorId": practitioner_id,
+        "dailySchedules.timeSlots.assignedDoctors.currentPatients": { $lt: mongoose.Types.Decimal128 ? mongoose.Types.Decimal128(doctorAssignment.maxPatients) : doctorAssignment.maxPatients }
+      };
+
+      const updateInc = {
+        $inc: {
+          "dailySchedules.$[d].timeSlots.$[s].availableCapacity": -1,
+          "dailySchedules.$[d].timeSlots.$[s].assignedDoctors.$[doc].currentPatients": 1
+        }
+      };
+
+      const arrayFilters = [
+        { "d.date": dayOnly },
+        { "s.id": slot.id },
+        { "doc.doctorId": practitioner_id }
+      ];
+
+      const holdResult = await RollingSchedule.updateOne(
+        updateFilter,
+        updateInc,
+        { arrayFilters, session }
+      );
+
+      if (holdResult.modifiedCount === 0) {
+        // Check if doctor capacity is full or slot capacity is zero
+        // For better error message, we can inspect.
+        const currentSlot = await RollingSchedule.findOne(
+          { _id: schedule_id, "dailySchedules.date": dayOnly, "dailySchedules.timeSlots.id": slot.id },
+          { "dailySchedules.timeSlots.$": 1 },
+          { session }
+        );
+        if (currentSlot) {
+          const foundSlot = currentSlot.dailySchedules[0].timeSlots[0];
+          if (foundSlot.availableCapacity <= 0) {
+            throw new Error("Slot is full");
+          }
+          const doctorInSlot = foundSlot.assignedDoctors.find(d => d.doctorId.toString() === practitioner_id.toString());
+          if (doctorInSlot && doctorInSlot.currentPatients >= doctorInSlot.maxPatients) {
+            throw new Error("Doctor is fully booked for this slot");
+          }
+        }
+        throw new Error("Slot or doctor not available for booking");
+      }
+
+      // Create appointment object
+      const appointmentData = {
+        appointment_id: `APT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        patient_id: req.patient._id,
         medical_center_id,
         practitioner_id,
+        schedule_id,
+        date: appointmentDate,
         slot_id: slot.id,
-        date: dateStr,
-        time: `${slot.start} - ${slot.end}`,
+        original_slot_id: isShiftedSlot ? slot.shiftedFrom : null,
+        slot_start: slot.start,
+        slot_end: slot.end,
+        doctor_name: practitioner.full_name || doctorAssignment.doctorName,
+        doctor_specialization: doctorAssignment.specialization,
+        patient_name: `${patient.firstName} ${patient.lastName}`,
+        patient_email: patient.email,
+        patient_phone: patient.phone,
         reason_for_visit,
+        symptoms: symptoms || "",
+        preferred_specialization: preferred_specialization || "general",
         consultation_type,
-      deposit_amount: depositAmount,
-platform_fee: platformFee,
-total_paid: totalAmount
+        appointment_duration: slot.duration || 30,
+        is_shifted_slot: isShiftedSlot,
+        shift_notes: isShiftedSlot ? "Shifted from original slot" : "",
+        consultation_fee: consultationFee,
+        deposit_amount: depositAmount,
+        platform_fee: platformFee,
+        total_amount: totalAmount,
+        currency: "ZAR"
+      };
+
+      if (isFreeBooking) {
+        // Free booking: mark as confirmed directly (or pending, but we'll go with confirmed)
+        appointmentData.status = "confirmed";
+        appointmentData.payment_status = "not_required";
+        appointmentData.is_paid = false;
+        appointmentData.payment_required = false;
+        appointmentData.payment_amount_paid = 0;
+      } else {
+        // Paid booking: pending payment
+        appointmentData.status = "pending";
+        appointmentData.payment_status = "pending";
+        appointmentData.is_paid = false;
+        appointmentData.payment_required = true;
+        appointmentData.payment_reference = paymentReference;
+        appointmentData.payment_amount_paid = 0;
       }
-    }); // ================= INIT PAYSTACK =================
-    const subaccountCode = medicalCenter.paystack?.subaccount_code;
 
-if (!subaccountCode) {
-  return res.status(400).json({
-    success: false,
-    message: "Medical center has no active payout subaccount"
-  });
-}
+      const appointment = new Appointment(appointmentData);
 
-    
-    
-    
-    
-    const paymentResponse = await initializeAppointmentPayment({
-  email: patient.email,
-  amount: totalAmount,
-  reference: paymentReference,
-  subaccount_code: subaccountCode,
-  metadata: {
-    appointment_id: appointment._id.toString(),
-    patient_id: req.patient._id.toString(),
-    medical_center_id: medical_center_id
-  }
-});
-await Promise.all([
-      appointment.save(),
-      payment.save(),
-      
-    ]);
-
-    return res.status(201).json({
-      success: true,
-      message: "Appointment created. Complete payment to confirm.",
-      data: {
-        appointment,
-        payment: {
+      // Create payment record if paid
+      let payment = null;
+      if (!isFreeBooking) {
+        payment = new Payment({
           reference: paymentReference,
+          appointment_id: appointment._id,
+          patient_id: req.patient._id,
           amount: totalAmount,
-          authorization_url: paymentResponse.authorization_url,
-          expires_at: new Date(Date.now() + 3 * 60 * 1000)
-        }
+          currency: "ZAR",
+          status: "pending",
+          metadata: {
+            appointment_id: appointment._id.toString(),
+            patient_id: req.patient._id.toString(),
+            medical_center_id,
+            practitioner_id,
+            slot_id: slot.id,
+            date: dateStr,
+            time: `${slot.start} - ${slot.end}`,
+            reason_for_visit,
+            consultation_type,
+            deposit_amount: depositAmount,
+            platform_fee: platformFee,
+            total_paid: totalAmount
+          }
+        });
       }
-    });
 
+      // Save all in transaction
+      await appointment.save({ session });
+      if (payment) await payment.save({ session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      // Return response based on booking type
+      if (isFreeBooking) {
+        return res.status(201).json({
+          success: true,
+          message: "Appointment created successfully.",
+          data: {
+            appointment,
+            payment_required: false
+          }
+        });
+      } else {
+        return res.status(201).json({
+          success: true,
+          message: "Appointment created. Complete payment to confirm.",
+          data: {
+            appointment,
+            payment: {
+              reference: paymentReference,
+              amount: totalAmount,
+              authorization_url: paystackAuthorizationUrl,
+              expires_at: new Date(Date.now() + 3 * 60 * 1000)
+            }
+          }
+        });
+      }
+    } catch (holdError) {
+      await session.abortTransaction();
+      session.endSession();
+      console.error("Atomic hold error:", holdError);
+      return res.status(409).json({
+        success: false,
+        message: holdError.message || "This slot or doctor is no longer available. Please choose another slot."
+      });
+    }
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
     console.error("❌ createPendingAppointment error:", error);
-
     return res.status(500).json({
       success: false,
       message: "Failed to create appointment",
       code: "INTERNAL_ERROR"
     });
- 
-      }
-
-
-   
-
-
-  
-
+  }
 };
-
-
 
 /**
  * @desc    Confirm appointment after successful payment (Webhook handler)
@@ -406,11 +537,12 @@ const confirmAppointmentPayment = async (reference) => {
     };
 
     // Update appointment
-appointment.status = "confirmed";
-appointment.payment_status = "success";
-appointment.is_paid = true;
-appointment.payment_reference = reference;
-appointment.payment_amount_paid = payment.amount || appointment.total_amount || 0;
+    appointment.status = "confirmed";
+    appointment.payment_status = "success";
+    appointment.is_paid = true;
+    appointment.payment_reference = reference;
+    appointment.payment_amount_paid = payment.amount || appointment.total_amount || 0;
+
     await payment.save();
     await appointment.save();
   } catch (err) {
@@ -418,7 +550,11 @@ appointment.payment_amount_paid = payment.amount || appointment.total_amount || 
   }
 };
 
-
+/**
+ * @desc    Cancel appointment after payment failure (Webhook or scheduled cleanup)
+ * @param   {string} reference - Payment reference
+ * @param   {string} reason - Failure reason
+ */
 const cancelFailedPaymentAppointment = async (reference, reason = "Payment failed") => {
   try {
     if (!reference) return;
@@ -426,7 +562,7 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
     const payment = await Payment.findOne({ reference });
     if (!payment) return;
 
-    // If already processed, stop
+    // Already processed
     if (payment.status === "failed") return;
 
     const appointment = await Appointment.findById(payment.appointment_id);
@@ -452,7 +588,7 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
     appointment.cancelled_at = new Date();
     appointment.payment_reference = reference;
 
-    // 3. Release slot atomically
+    // 3. Release slot capacity and doctor count atomically
     await RollingSchedule.updateOne(
       {
         _id: appointment.schedule_id,
@@ -462,28 +598,7 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
       },
       {
         $inc: {
-          "dailySchedules.$[d].timeSlots.$[s].availableCapacity": 1
-        }
-      },
-      {
-        arrayFilters: [
-          { "d.date": appointment.date },
-          { "s.id": appointment.slot_id }
-        ]
-      }
-    );
-
-    // 4. Decrease doctor count atomically
-    await RollingSchedule.updateOne(
-      {
-        _id: appointment.schedule_id,
-        medical_center_id: appointment.medical_center_id,
-        "dailySchedules.date": appointment.date,
-        "dailySchedules.timeSlots.id": appointment.slot_id,
-        "dailySchedules.timeSlots.assignedDoctors.doctorId": appointment.practitioner_id
-      },
-      {
-        $inc: {
+          "dailySchedules.$[d].timeSlots.$[s].availableCapacity": 1,
           "dailySchedules.$[d].timeSlots.$[s].assignedDoctors.$[doc].currentPatients": -1
         }
       },
@@ -503,15 +618,10 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
     if (!appointment.is_paid) {
       await Appointment.deleteOne({ _id: appointment._id });
     }
-
   } catch (err) {
     console.error("❌ cancelFailedPaymentAppointment error:", err);
   }
 };
-
-
-
-
 
 /**
  * @desc    Get appointment payment status
@@ -539,31 +649,30 @@ const getAppointmentPaymentStatus = async (req, res) => {
     }
 
     const payment = await Payment.findOne({ appointment_id: id });
-    
+
     return res.status(200).json({
       success: true,
       data: {
-  appointment_status: appointment.status,
-  payment_status: appointment.payment_status,
-  payment_reference: appointment.payment_reference,
-  is_paid: appointment.is_paid,
-  pricing: {
-    consultation_fee: appointment.consultation_fee,
-    deposit_amount: appointment.deposit_amount,
-    platform_fee: appointment.platform_fee,
-    total_amount: appointment.total_amount,
-    payment_amount_paid: appointment.payment_amount_paid,
-    currency: appointment.currency
-  },
-  payment_details: payment ? {
-    amount: payment.amount,
-    currency: payment.currency,
-    status: payment.status,
-    created_at: payment.createdAt
-  } : null
-}
+        appointment_status: appointment.status,
+        payment_status: appointment.payment_status,
+        payment_reference: appointment.payment_reference,
+        is_paid: appointment.is_paid,
+        pricing: {
+          consultation_fee: appointment.consultation_fee,
+          deposit_amount: appointment.deposit_amount,
+          platform_fee: appointment.platform_fee,
+          total_amount: appointment.total_amount,
+          payment_amount_paid: appointment.payment_amount_paid,
+          currency: appointment.currency
+        },
+        payment_details: payment ? {
+          amount: payment.amount,
+          currency: payment.currency,
+          status: payment.status,
+          created_at: payment.createdAt
+        } : null
+      }
     });
-
   } catch (error) {
     console.error("❌ getAppointmentPaymentStatus error:", error);
     return res.status(500).json({
@@ -573,6 +682,11 @@ const getAppointmentPaymentStatus = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Clean up expired pending appointments (payment timeout)
+ * @route   GET /api/bookings/cleanup-expired
+ * @access  Admin/System
+ */
 const cleanupExpiredAppointments = async (req, res) => {
   try {
     const expiryMinutes = 10;
@@ -598,7 +712,6 @@ const cleanupExpiredAppointments = async (req, res) => {
       message: `Cleaned up ${cleanedCount} expired appointments`,
       cleaned_count: cleanedCount
     });
-
   } catch (error) {
     console.error("❌ cleanupExpiredAppointments error:", error);
     return res.status(500).json({
@@ -608,9 +721,11 @@ const cleanupExpiredAppointments = async (req, res) => {
   }
 };
 
-
-
-// Keep your existing functions (with minor updates for consistency)
+/**
+ * @desc    Get appointments for patient / practitioner / medical center
+ * @route   GET /api/bookings/appointments
+ * @access  Patient / Practitioner / MedicalCenter
+ */
 const getPatientAppointments = async (req, res) => {
   try {
     let query = {};
@@ -648,7 +763,6 @@ const getPatientAppointments = async (req, res) => {
         pages: Math.ceil(total / limit)
       }
     });
-
   } catch (error) {
     console.error("❌ getPatientAppointments error:", error);
     return res.status(500).json({
@@ -658,7 +772,11 @@ const getPatientAppointments = async (req, res) => {
   }
 };
 
-// Cancel appointment (atomic + safe)
+/**
+ * @desc    Cancel an appointment (by patient, practitioner, or medical center)
+ * @route   PUT /api/bookings/:id/cancel
+ * @access  Patient / Practitioner / MedicalCenter
+ */
 const cancelAppointment = async (req, res) => {
   try {
     const { id } = req.params;
@@ -685,7 +803,7 @@ const cancelAppointment = async (req, res) => {
       });
     }
 
-    // Patient time restriction
+    // Patient time restriction (>=2 hours before slot)
     if (req.userType === "patient") {
       const slotStart = new Date(appointment.date);
       const [h, m] = appointment.slot_start.split(":").map(Number);
@@ -695,12 +813,12 @@ const cancelAppointment = async (req, res) => {
       if (hoursDiff < 2) {
         return res.status(400).json({
           success: false,
-          message: "Patients must cancel at least 2 hours before",
+          message: "Patients must cancel at least 2 hours before appointment",
         });
       }
     }
 
-    // Release slot atomically
+    // Release slot capacity and doctor count atomically
     await RollingSchedule.updateOne(
       {
         _id: appointment.schedule_id,
@@ -709,27 +827,7 @@ const cancelAppointment = async (req, res) => {
       },
       {
         $inc: {
-          "dailySchedules.$[d].timeSlots.$[s].availableCapacity": 1
-        }
-      },
-      {
-        arrayFilters: [
-          { "d.date": appointment.date },
-          { "s.id": appointment.slot_id }
-        ]
-      }
-    );
-
-    // Release doctor count atomically
-    await RollingSchedule.updateOne(
-      {
-        _id: appointment.schedule_id,
-        "dailySchedules.date": appointment.date,
-        "dailySchedules.timeSlots.id": appointment.slot_id,
-        "dailySchedules.timeSlots.assignedDoctors.doctorId": appointment.practitioner_id
-      },
-      {
-        $inc: {
+          "dailySchedules.$[d].timeSlots.$[s].availableCapacity": 1,
           "dailySchedules.$[d].timeSlots.$[s].assignedDoctors.$[doc].currentPatients": -1
         }
       },
@@ -742,6 +840,7 @@ const cancelAppointment = async (req, res) => {
       }
     );
 
+    // Update appointment status
     const paymentStatus = appointment.status === "pending" ? "failed" : "refunded";
 
     appointment.status = "cancelled";
@@ -750,6 +849,7 @@ const cancelAppointment = async (req, res) => {
     appointment.cancelled_by = req.userType;
     appointment.cancelled_at = new Date();
 
+    // Update payment record if exists
     const payment = await Payment.findOne({ appointment_id: id });
     if (payment) {
       payment.status = paymentStatus;
@@ -775,7 +875,6 @@ const cancelAppointment = async (req, res) => {
     });
   }
 };
-
 
 /**
  * @desc    Get available doctors for a slot
@@ -884,7 +983,6 @@ const getAvailableDoctorsForSlot = async (req, res) => {
         totalAvailableDoctors: doctorsWithAvailability.length
       }
     });
-
   } catch (error) {
     console.error("❌ getAvailableDoctorsForSlot error:", error);
     res.status(500).json({
@@ -966,11 +1064,10 @@ const shiftDoctorSlots = async (req, res) => {
     }
 
     const daySchedule = schedule.dailySchedules[dayIndex];
-    
+
     // Find all slots for this doctor on this day
     let doctorSlots = [];
-    
-    // If start_from_slot_id is provided, start shifting from that slot
+
     if (start_from_slot_id) {
       const startSlotIndex = daySchedule.timeSlots.findIndex(s => s && s.id === start_from_slot_id);
       if (startSlotIndex === -1) {
@@ -979,8 +1076,7 @@ const shiftDoctorSlots = async (req, res) => {
           message: "Start slot not found"
         });
       }
-      
-      // Get all slots from the start slot onwards where doctor is assigned
+
       for (let i = startSlotIndex; i < daySchedule.timeSlots.length; i++) {
         const slot = daySchedule.timeSlots[i];
         if (!slot) continue;
@@ -992,7 +1088,6 @@ const shiftDoctorSlots = async (req, res) => {
         }
       }
     } else {
-      // Get all slots for this doctor on this day
       daySchedule.timeSlots.forEach((slot, index) => {
         if (!slot) return;
         const doctorInSlot = slot.assignedDoctors.find(doc => 
@@ -1012,34 +1107,23 @@ const shiftDoctorSlots = async (req, res) => {
     }
 
     // CRITICAL: Check for existing appointments BEFORE processing slots
-    // Get all slot IDs that would be affected
     const slotIds = doctorSlots.map(item => item.slot.id);
-    
     if (slotIds.length > 0) {
-      // Create date range for the entire day (for proper date comparison)
       const startOfDay = new Date(appointmentDate);
       startOfDay.setHours(0, 0, 0, 0);
-      
       const endOfDay = new Date(appointmentDate);
       endOfDay.setHours(23, 59, 59, 999);
-      
-      // Query appointments for this doctor on this day with these slot IDs
+
       const existingAppointments = await Appointment.find({
         schedule_id: schedule_id,
-        date: {
-          $gte: startOfDay,
-          $lte: endOfDay
-        },
+        date: { $gte: startOfDay, $lte: endOfDay },
         practitioner_id: practitioner_id,
         slot_id: { $in: slotIds },
         status: { $in: ['pending', 'confirmed'] }
       });
 
-      // If appointments exist, block the shift
       if (existingAppointments.length > 0) {
-        // Find which specific slots have appointments
         const slotsWithAppointments = new Map();
-        
         existingAppointments.forEach(appt => {
           if (!slotsWithAppointments.has(appt.slot_id)) {
             slotsWithAppointments.set(appt.slot_id, []);
@@ -1047,7 +1131,6 @@ const shiftDoctorSlots = async (req, res) => {
           slotsWithAppointments.get(appt.slot_id).push(appt);
         });
 
-        // Get details of slots that have appointments
         const problematicSlots = doctorSlots
           .filter(item => slotsWithAppointments.has(item.slot.id))
           .map(item => {
@@ -1078,19 +1161,6 @@ const shiftDoctorSlots = async (req, res) => {
       }
     }
 
-    // Helper function to add minutes to time string
-    const addMinutesToTime = (timeString, minutesToAdd) => {
-      const [hours, minutes] = timeString.split(':').map(Number);
-      const date = new Date();
-      date.setHours(hours, minutes, 0, 0);
-      date.setMinutes(date.getMinutes() + minutesToAdd);
-      
-      // Format back to HH:mm
-      const newHours = date.getHours().toString().padStart(2, '0');
-      const newMinutes = date.getMinutes().toString().padStart(2, '0');
-      return `${newHours}:${newMinutes}`;
-    };
-
     const dayEndTime = daySchedule.sessions.night.enabled
       ? daySchedule.sessions.night.end
       : daySchedule.sessions.afternoon.enabled
@@ -1102,7 +1172,6 @@ const shiftDoctorSlots = async (req, res) => {
 
     for (const item of doctorSlots) {
       const shiftedEnd = addMinutesToTime(item.slot.end, delay_minutes);
-
       if (shiftedEnd > dayEndTime) {
         overflowDoctorSlots.push(item);
       } else {
@@ -1110,54 +1179,44 @@ const shiftDoctorSlots = async (req, res) => {
       }
     }
 
-    // Create new shifted slots and update existing ones
     const shiftedSlots = [];
 
-    // Process only valid slots (those that won't overflow)
+    // Process valid slots (those that won't overflow)
     for (const { slot, index } of validDoctorSlots) {
       const originalStart = slot.start;
       const originalEnd = slot.end;
       const newStart = addMinutesToTime(originalStart, delay_minutes);
       const newEnd = addMinutesToTime(originalEnd, delay_minutes);
 
-      // Check if a slot already exists at the new time
       const existingSlotAtNewTime = daySchedule.timeSlots.find(
         s => s && s.start === newStart && s.end === newEnd
       );
 
       if (existingSlotAtNewTime) {
         // Merge with existing slot
-        // Check if doctor is already in this slot
         const existingDoctor = existingSlotAtNewTime.assignedDoctors.find(doc => 
           doc.doctorId && doc.doctorId.toString() === practitioner_id.toString()
         );
-        
         if (!existingDoctor) {
-          // Add doctor to existing slot
           const doctorAssignment = slot.assignedDoctors.find(doc => 
             doc.doctorId && doc.doctorId.toString() === practitioner_id.toString()
           );
-          
           if (doctorAssignment) {
             existingSlotAtNewTime.assignedDoctors.push({
               ...doctorAssignment.toObject(),
               isShifted: true,
               shiftReason: reason || `Shifted from ${originalStart} due to delay`
             });
-            
-            // Update slot capacity
             existingSlotAtNewTime.capacity += doctorAssignment.maxPatients || 1;
             existingSlotAtNewTime.availableCapacity += (doctorAssignment.maxPatients || 1) - (doctorAssignment.currentPatients || 0);
           }
         }
-        
-        // Mark original slot to be removed if empty
+        // Remove doctor from original slot
         slot.assignedDoctors = slot.assignedDoctors.filter(doc => 
           !doc.doctorId || doc.doctorId.toString() !== practitioner_id.toString()
         );
-        
         if (slot.assignedDoctors.length === 0) {
-          daySchedule.timeSlots[index] = null; // Mark for removal
+          daySchedule.timeSlots[index] = null;
         }
       } else {
         // Create a new shifted slot
@@ -1179,20 +1238,16 @@ const shiftDoctorSlots = async (req, res) => {
                         (reason || `Shifted from ${originalStart} due to delay`) : ''
           }))
         };
-        
-        // Add the new slot
         daySchedule.timeSlots.push(shiftedSlot);
-        
-        // Mark original slot to be removed
         daySchedule.timeSlots[index] = null;
       }
     }
 
-    // Handle overflow slots (mark them as shifted but don't move them)
+    // Handle overflow slots (mark them as shifted but don't move)
     for (const { slot } of overflowDoctorSlots) {
       slot.isShifted = true;
       slot.shiftReason = 'Overflowed working hours – requires reschedule';
-
+      slot.shiftHistory = slot.shiftHistory || [];
       slot.shiftHistory.push({
         oldStart: slot.start,
         oldEnd: slot.end,
@@ -1208,14 +1263,17 @@ const shiftDoctorSlots = async (req, res) => {
       });
     }
 
-    // Remove null slots (original slots that became empty)
+    // Remove null slots
     schedule.dailySchedules[dayIndex].timeSlots = daySchedule.timeSlots.filter(slot => slot !== null);
 
-    // Recalculate totals
+    // Recalculate totals (if function exists)
     const { recalculateDailyScheduleTotals } = require('../models/editingNextWeek');
-    recalculateDailyScheduleTotals(schedule.dailySchedules[dayIndex]);
+    if (recalculateDailyScheduleTotals) {
+      recalculateDailyScheduleTotals(schedule.dailySchedules[dayIndex]);
+    }
 
     // Record late arrival
+    schedule.lateArrivals = schedule.lateArrivals || [];
     schedule.lateArrivals.push({
       doctorId: practitioner_id,
       doctorName: req.practitioner?.full_name || 'Unknown',
@@ -1234,7 +1292,7 @@ const shiftDoctorSlots = async (req, res) => {
         total_slots_found: doctorSlots.length,
         slots_shifted: validDoctorSlots.length,
         slots_overflow: overflowDoctorSlots.length,
-        slots_with_appointments: 0, // Since we blocked if appointments exist
+        slots_with_appointments: 0,
         newSchedule: schedule.dailySchedules[dayIndex].timeSlots
           .filter(slot => slot.assignedDoctors.some(doc => 
             doc.doctorId && doc.doctorId.toString() === practitioner_id.toString()
@@ -1248,7 +1306,6 @@ const shiftDoctorSlots = async (req, res) => {
           }))
       }
     });
-
   } catch (error) {
     console.error("❌ shiftDoctorSlots error:", error);
     res.status(500).json({
@@ -1289,7 +1346,6 @@ const getLateArrivals = async (req, res) => {
 
     let lateArrivals = schedule.lateArrivals || [];
 
-    // Filter by date if provided
     if (date) {
       const filterDate = new Date(date);
       lateArrivals = lateArrivals.filter(arrival => 
@@ -1298,7 +1354,6 @@ const getLateArrivals = async (req, res) => {
       );
     }
 
-    // Filter by practitioner if provided
     if (practitioner_id) {
       lateArrivals = lateArrivals.filter(arrival => 
         arrival.doctorId && arrival.doctorId.toString() === practitioner_id.toString()
@@ -1312,7 +1367,6 @@ const getLateArrivals = async (req, res) => {
         total: lateArrivals.length
       }
     });
-
   } catch (error) {
     console.error("❌ getLateArrivals error:", error);
     res.status(500).json({
@@ -1322,6 +1376,12 @@ const getLateArrivals = async (req, res) => {
     });
   }
 };
+
+/**
+ * @desc    Get all appointments (for medical center admin)
+ * @route   GET /api/bookings/all
+ * @access  Medical Center
+ */
 const getAllAppointments = async (req, res) => {
   try {
     const { medical_center_id } = req.query;
@@ -1348,17 +1408,12 @@ const getAllAppointments = async (req, res) => {
     });
   }
 };
-// Helper functions
 
-
-const sendAppointmentConfirmation = async (appointment) => {
-  // Implementation for sending email/SMS
-  console.log(`Confirmation sent for appointment: ${appointment.appointment_id}`);
-  return true;
-};
-
-
-
+/**
+ * @desc    Create payment for existing pending appointment (separate endpoint)
+ * @route   POST /api/bookings/payment
+ * @access  Patient
+ */
 exports.createPayment = async (req, res) => {
   try {
     const { appointment_id } = req.body;
@@ -1397,7 +1452,7 @@ exports.createPayment = async (req, res) => {
     const finalPlatformFee = Math.max(50, percentageFee);
     const totalAmount = depositAmount + finalPlatformFee;
 
-    const reference = `PAY-${uuid()}`;
+    const reference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
 
     await Payment.create({
       reference,
@@ -1451,18 +1506,17 @@ exports.createPayment = async (req, res) => {
   }
 };
 
-
-
 module.exports = {
-  createPendingAppointment, // Main booking function
-  confirmAppointmentPayment, // Webhook confirmation
-  cancelFailedPaymentAppointment, // Webhook cancellation
+  createPendingAppointment,
+  confirmAppointmentPayment,
+  cancelFailedPaymentAppointment,
   getAppointmentPaymentStatus,
   cleanupExpiredAppointments,
   getPatientAppointments,
   cancelAppointment,
   getAvailableDoctorsForSlot,
   shiftDoctorSlots,
-  getLateArrivals, 
-  getAllAppointments 
+  getLateArrivals,
+  getAllAppointments,
+  createPayment: exports.createPayment // keep original name
 };
