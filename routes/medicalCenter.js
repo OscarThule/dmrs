@@ -35,7 +35,7 @@ router.put(
   updateBankDetails
 );
 
-router.post('/practitioners', addPractitioner);
+
 
 router.put('/payment-settings', updatePaymentSettings);
 
