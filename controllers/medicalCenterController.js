@@ -1,10 +1,83 @@
 const MedicalCenter = require('../models/MedicalCenter');
 const bcrypt = require('bcryptjs');
 const { generateToken } = require('../utils/generateToken');
-const { v4: uuidv4 } = require('uuid');
 const { createPaystackSubaccount } = require('../services/paystackSubaccountService');
 const crypto = require('crypto');
 const sendEmail = require('../utils/sendEmail');
+
+// ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
+const sanitizeString = (value) => {
+  return typeof value === 'string' ? value.trim() : value;
+};
+
+const buildCleanAddress = (address = {}) => {
+  const hasLatLng =
+    typeof address.lat === 'number' &&
+    Number.isFinite(address.lat) &&
+    typeof address.lng === 'number' &&
+    Number.isFinite(address.lng);
+
+  const hasGooglePlaceData =
+    typeof address.place_id === 'string' &&
+    address.place_id.trim().length > 0 &&
+    typeof address.formatted_address === 'string' &&
+    address.formatted_address.trim().length > 0 &&
+    hasLatLng;
+
+  let finalLocationSource = 'address';
+
+  if (address.location_source === 'address_and_geolocation') {
+    finalLocationSource = 'address_and_geolocation';
+  } else if (address.location_source === 'geolocation') {
+    finalLocationSource = 'geolocation';
+  }
+
+  const builtFullAddress = [
+    address.line1?.trim() || '',
+    address.line2?.trim() || '',
+    address.city?.trim() || '',
+    address.province?.trim() || '',
+    address.postal?.trim() || '',
+    'South Africa'
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  return {
+    line1: address.line1?.trim() || '',
+    line2: address.line2?.trim() || '',
+    city: address.city?.trim() || '',
+    province: address.province?.trim() || '',
+    postal: address.postal?.trim() || '',
+    full_address: address.full_address?.trim() || builtFullAddress,
+    formatted_address: address.formatted_address?.trim() || '',
+    place_id: address.place_id?.trim() || '',
+    lat: hasLatLng ? address.lat : null,
+    lng: hasLatLng ? address.lng : null,
+    location_source: finalLocationSource,
+    is_location_verified: hasGooglePlaceData || finalLocationSource === 'geolocation'
+  };
+};
+
+const buildCleanBankDetails = (bankDetails = {}, fallbackAccountName = '') => {
+  return {
+    bank_name: bankDetails?.bank_name?.trim() || '',
+    bank_code: bankDetails?.bank_code?.trim() || '',
+    account_number: bankDetails?.account_number?.trim() || '',
+    account_name: bankDetails?.account_name?.trim() || fallbackAccountName || ''
+  };
+};
+
+const shouldAttemptSubaccountCreation = (bankDetails) => {
+  return (
+    !!bankDetails.bank_name &&
+    !!bankDetails.bank_code &&
+    !!bankDetails.account_number &&
+    !!bankDetails.account_name
+  );
+};
 
 // ----------------------------------------------------------------------
 // @desc    Register medical center
@@ -21,19 +94,10 @@ const registerMedicalCenter = async (req, res) => {
       official_domain_email,
       phone,
       address,
-      practitioners = [],
       bankDetails = {},
       password
     } = req.body;
 
-    const bank_name = bankDetails?.bank_name?.trim();
-    const bank_code = bankDetails?.bank_code?.trim();
-    const account_number = bankDetails?.account_number?.trim();
-    const account_name = bankDetails?.account_name?.trim() || facility_name?.trim();
-
-    // -----------------------------
-    // Basic validation
-    // -----------------------------
     if (
       !facility_name ||
       !official_domain_email ||
@@ -49,64 +113,46 @@ const registerMedicalCenter = async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message:
-          'Please provide all required medical center registration fields'
+        message: 'Please provide all required medical center registration fields'
       });
     }
 
-    // -----------------------------
-    // Hash password
-    // -----------------------------
+    const cleanedAddress = buildCleanAddress(address);
+    const cleanedBankDetails = buildCleanBankDetails(bankDetails, facility_name.trim());
+
     const saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS, 10) || 12;
     const hashedPassword = await bcrypt.hash(password, await bcrypt.genSalt(saltRounds));
 
-    // -----------------------------
-    // Create base medical center
-    // -----------------------------
     const medicalCenter = await MedicalCenter.create({
       facility_name: facility_name.trim(),
       company_reg_number: company_reg_number.trim(),
       healthcare_reg_number: healthcare_reg_number.trim(),
-      facility_type,
+      facility_type: facility_type.trim(),
       official_domain_email: official_domain_email.trim().toLowerCase(),
       phone: phone.trim(),
       password: hashedPassword,
-      address,
-      practitioners,
+      address: cleanedAddress,
       paystack: {
         subaccount_code: null,
         is_subaccount_active: false,
-        bank_details: {
-          bank_name: bank_name || '',
-          bank_code: bank_code || '',
-          account_number: account_number || '',
-          account_name: account_name || ''
-        }
+        bank_details: cleanedBankDetails
       }
     });
 
     let subaccountCreationMessage = null;
 
-    // -----------------------------
-    // Create subaccount immediately
-    // -----------------------------
-    if (bank_name && bank_code && account_number && account_name) {
+    if (shouldAttemptSubaccountCreation(cleanedBankDetails)) {
       try {
         const subaccount = await createPaystackSubaccount({
           business_name: medicalCenter.facility_name,
-          settlement_bank: bank_code,
-          account_number,
+          settlement_bank: cleanedBankDetails.bank_code,
+          account_number: cleanedBankDetails.account_number,
           percentage_charge: 0
         });
 
         medicalCenter.paystack.subaccount_code = subaccount.subaccount_code;
         medicalCenter.paystack.is_subaccount_active = true;
-        medicalCenter.paystack.bank_details = {
-          bank_name,
-          bank_code,
-          account_number,
-          account_name
-        };
+        medicalCenter.paystack.bank_details = cleanedBankDetails;
         medicalCenter.paystack.created_at = new Date();
         medicalCenter.paystack.updated_at = new Date();
 
@@ -126,9 +172,6 @@ const registerMedicalCenter = async (req, res) => {
         console.error('❌ Paystack subaccount creation failed during registration:', {
           medicalCenterId: medicalCenter._id.toString(),
           facility_name: medicalCenter.facility_name,
-          bank_name,
-          bank_code,
-          account_number,
           error: paystackError
         });
 
@@ -145,9 +188,6 @@ const registerMedicalCenter = async (req, res) => {
         'Medical center registered without complete bank details. Payout setup is incomplete.';
     }
 
-    // -----------------------------
-    // Generate token
-    // -----------------------------
     const token = generateToken(medicalCenter._id);
 
     return res.status(201).json({
@@ -163,6 +203,7 @@ const registerMedicalCenter = async (req, res) => {
         official_domain_email: medicalCenter.official_domain_email,
         verification_status: medicalCenter.verification_status,
         is_verified: medicalCenter.is_verified,
+        address: medicalCenter.address,
         paystack: {
           subaccount_code: medicalCenter.paystack?.subaccount_code,
           is_subaccount_active: medicalCenter.paystack?.is_subaccount_active,
@@ -214,7 +255,7 @@ const loginMedicalCenter = async (req, res) => {
     }
 
     const medicalCenter = await MedicalCenter.findOne({
-      official_domain_email: email
+      official_domain_email: email.trim().toLowerCase()
     }).select('+password');
 
     if (!medicalCenter) {
@@ -241,7 +282,7 @@ const loginMedicalCenter = async (req, res) => {
 
     const token = generateToken(medicalCenter._id);
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: 'Login successful',
       token,
@@ -255,7 +296,7 @@ const loginMedicalCenter = async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Error logging in',
       error: process.env.NODE_ENV === 'production' ? {} : error.message
@@ -270,16 +311,15 @@ const loginMedicalCenter = async (req, res) => {
 // ----------------------------------------------------------------------
 const getMe = async (req, res) => {
   try {
-    const medicalCenter = await MedicalCenter.findById(req.medicalCenter._id)
-      .select('-password');
+    const medicalCenter = await MedicalCenter.findById(req.medicalCenter._id).select('-password');
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       data: medicalCenter
     });
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Error fetching profile',
       error: process.env.NODE_ENV === 'production' ? {} : error.message
@@ -288,20 +328,21 @@ const getMe = async (req, res) => {
 };
 
 // ----------------------------------------------------------------------
-// @desc    Get all medical centers (admin only)
+// @desc    Get all medical centers
 // @route   GET /api/medical-centers
 // @access  Private/Admin
 // ----------------------------------------------------------------------
 const getAllMedicalCenters = async (req, res) => {
   try {
     const centers = await MedicalCenter.find().select('-password');
-    res.status(200).json({
+
+    return res.status(200).json({
       success: true,
       data: centers
     });
   } catch (error) {
     console.error('Get all centers error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: error.message
     });
@@ -309,97 +350,127 @@ const getAllMedicalCenters = async (req, res) => {
 };
 
 // ----------------------------------------------------------------------
-// @desc    Add practitioner to medical center
-// @route   POST /api/medical-centers/practitioners
-// @access  Private
-// ----------------------------------------------------------------------
-const addPractitioner = async (req, res) => {
-  try {
-    const {
-      full_name,
-      role,
-      professional_license_number,
-      license_type = 'HPCSA',
-      contact_email,
-      contact_phone,
-      branch_id = null
-    } = req.body;
-
-    if (!full_name || !role || !contact_email) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide full name, role, and contact email'
-      });
-    }
-
-    const medicalCenter = await MedicalCenter.findById(req.medicalCenter._id);
-
-    const newPractitioner = {
-      practitioner_id: uuidv4(),
-      full_name,
-      role,
-      professional_license_number,
-      license_type,
-      contact_email,
-      contact_phone,
-      verification_status: 'unverified'
-    };
-
-    if (branch_id) {
-      const branch = medicalCenter.branches.id(branch_id);
-      if (branch) {
-        branch.practitioners.push(newPractitioner);
-      } else {
-        return res.status(404).json({
-          success: false,
-          message: 'Branch not found'
-        });
-      }
-    } else {
-      medicalCenter.practitioners.push(newPractitioner);
-    }
-
-    await medicalCenter.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Practitioner added successfully',
-      data: newPractitioner
-    });
-  } catch (error) {
-    console.error('Add practitioner error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error adding practitioner',
-      error: process.env.NODE_ENV === 'production' ? {} : error.message
-    });
-  }
-};
-
-// ----------------------------------------------------------------------
-// @desc    Update medical center profile
+// @desc    Update medical center profile and settings
 // @route   PUT /api/medical-centers/profile
 // @access  Private
 // ----------------------------------------------------------------------
 const updateProfile = async (req, res) => {
   try {
-    const updates = req.body;
+    const {
+      facility_name,
+      company_reg_number,
+      healthcare_reg_number,
+      facility_type,
+      official_domain_email,
+      phone,
+      address,
+      bankDetails
+    } = req.body;
 
-    delete updates.password;
-    delete updates.medical_center_id;
-    delete updates.verification_status;
-    delete updates.is_verified;
+    const medicalCenter = await MedicalCenter.findById(req.medicalCenter._id);
 
-    const medicalCenter = await MedicalCenter.findByIdAndUpdate(
-      req.medicalCenter._id,
-      updates,
-      { new: true, runValidators: true }
-    ).select('-password');
+    if (!medicalCenter) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medical center not found'
+      });
+    }
 
-    res.status(200).json({
+    if (facility_name !== undefined) {
+      medicalCenter.facility_name = sanitizeString(facility_name);
+    }
+
+    if (company_reg_number !== undefined) {
+      medicalCenter.company_reg_number = sanitizeString(company_reg_number);
+    }
+
+    if (healthcare_reg_number !== undefined) {
+      medicalCenter.healthcare_reg_number = sanitizeString(healthcare_reg_number);
+    }
+
+    if (facility_type !== undefined) {
+      medicalCenter.facility_type = sanitizeString(facility_type);
+    }
+
+    if (official_domain_email !== undefined) {
+      medicalCenter.official_domain_email = sanitizeString(official_domain_email)?.toLowerCase();
+    }
+
+    if (phone !== undefined) {
+      medicalCenter.phone = sanitizeString(phone);
+    }
+
+    if (address !== undefined) {
+      medicalCenter.address = buildCleanAddress(address);
+    }
+
+    let bankDetailsUpdated = false;
+
+    if (bankDetails !== undefined) {
+      const cleanedBankDetails = buildCleanBankDetails(
+        bankDetails,
+        medicalCenter.facility_name?.trim()
+      );
+
+      medicalCenter.paystack = medicalCenter.paystack || {};
+      medicalCenter.paystack.bank_details = cleanedBankDetails;
+      medicalCenter.paystack.updated_at = new Date();
+
+      bankDetailsUpdated = true;
+
+      if (shouldAttemptSubaccountCreation(cleanedBankDetails)) {
+        try {
+          const shouldCreateOrRecreateSubaccount =
+            !medicalCenter.paystack?.subaccount_code ||
+            medicalCenter.paystack?.is_subaccount_active !== true;
+
+          if (shouldCreateOrRecreateSubaccount) {
+            const subaccount = await createPaystackSubaccount({
+              business_name: medicalCenter.facility_name,
+              settlement_bank: cleanedBankDetails.bank_code,
+              account_number: cleanedBankDetails.account_number,
+              percentage_charge: 0
+            });
+
+            medicalCenter.paystack.subaccount_code = subaccount.subaccount_code;
+            medicalCenter.paystack.is_subaccount_active = true;
+            medicalCenter.paystack.created_at =
+              medicalCenter.paystack.created_at || new Date();
+            medicalCenter.paystack.updated_at = new Date();
+          }
+        } catch (err) {
+          const paystackError =
+            err?.response?.data?.message ||
+            err?.response?.data ||
+            err?.message ||
+            'Unknown Paystack error';
+
+          console.error('❌ Paystack subaccount update failed:', {
+            medicalCenterId: medicalCenter._id.toString(),
+            facility_name: medicalCenter.facility_name,
+            error: paystackError
+          });
+
+          medicalCenter.paystack.is_subaccount_active = false;
+          medicalCenter.paystack.updated_at = new Date();
+        }
+      } else {
+        medicalCenter.paystack.subaccount_code = null;
+        medicalCenter.paystack.is_subaccount_active = false;
+        medicalCenter.paystack.updated_at = new Date();
+      }
+    }
+
+    await medicalCenter.save();
+
+    const updatedCenter = await MedicalCenter.findById(medicalCenter._id).select('-password');
+
+    return res.status(200).json({
       success: true,
-      message: 'Profile updated successfully',
-      data: medicalCenter
+      message: bankDetailsUpdated
+        ? 'Profile and bank details updated successfully'
+        : 'Profile updated successfully',
+      data: updatedCenter
     });
   } catch (error) {
     console.error('Update profile error:', error);
@@ -412,7 +483,15 @@ const updateProfile = async (req, res) => {
       });
     }
 
-    res.status(500).json({
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map((val) => val.message);
+      return res.status(400).json({
+        success: false,
+        message: messages.join(', ')
+      });
+    }
+
+    return res.status(500).json({
       success: false,
       message: 'Error updating profile',
       error: process.env.NODE_ENV === 'production' ? {} : error.message
@@ -427,9 +506,9 @@ const updateProfile = async (req, res) => {
 // ----------------------------------------------------------------------
 const getPaymentSettings = async (req, res) => {
   try {
-    const center = await MedicalCenter
-      .findById(req.medicalCenter._id)
-      .select('paymentSettings facility_name medical_center_id');
+    const center = await MedicalCenter.findById(req.medicalCenter._id).select(
+      'paymentSettings facility_name medical_center_id'
+    );
 
     if (!center) {
       return res.status(404).json({
@@ -438,13 +517,13 @@ const getPaymentSettings = async (req, res) => {
       });
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       data: center.paymentSettings
     });
   } catch (error) {
     console.error('Get payment settings error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Failed to fetch payment settings'
     });
@@ -471,24 +550,48 @@ const updatePaymentSettings = async (req, res) => {
 
     const updates = {};
 
-    if (enablePayments !== undefined) updates['paymentSettings.enablePayments'] = enablePayments;
-    if (consultationFee !== undefined) updates['paymentSettings.consultationFee'] = consultationFee;
-    if (onlineConsultationFee !== undefined) updates['paymentSettings.onlineConsultationFee'] = onlineConsultationFee;
-    if (allowPartialPayments !== undefined) updates['paymentSettings.allowPartialPayments'] = allowPartialPayments;
-    if (paymentMethods?.length) updates['paymentSettings.paymentMethods'] = paymentMethods;
-    if (currency) updates['paymentSettings.currency'] = currency;
+    if (enablePayments !== undefined) {
+      updates['paymentSettings.enablePayments'] = enablePayments;
+    }
 
-    // Fixed deposit mode
+    if (consultationFee !== undefined) {
+      updates['paymentSettings.consultationFee'] = consultationFee;
+    }
+
+    if (onlineConsultationFee !== undefined) {
+      updates['paymentSettings.onlineConsultationFee'] = onlineConsultationFee;
+    }
+
+    if (allowPartialPayments !== undefined) {
+      updates['paymentSettings.allowPartialPayments'] = allowPartialPayments;
+    }
+
+    if (paymentMethods !== undefined) {
+      updates['paymentSettings.paymentMethods'] = paymentMethods;
+    }
+
+    if (currency !== undefined) {
+      updates['paymentSettings.currency'] = currency;
+    }
+
     if (bookingDeposit !== undefined) {
       updates['paymentSettings.bookingDeposit'] = bookingDeposit;
       updates['paymentSettings.depositPercentage'] = 0;
     }
 
-    // Percentage mode
     if (depositPercentage !== undefined) {
       updates['paymentSettings.depositPercentage'] = depositPercentage;
-      if (consultationFee)
-        updates['paymentSettings.bookingDeposit'] = Math.round((consultationFee * depositPercentage) / 100);
+
+      const feeToUse =
+        consultationFee !== undefined
+          ? consultationFee
+          : undefined;
+
+      if (feeToUse !== undefined) {
+        updates['paymentSettings.bookingDeposit'] = Math.round(
+          (feeToUse * depositPercentage) / 100
+        );
+      }
     }
 
     updates['paymentSettings.lastUpdated'] = new Date();
@@ -513,7 +616,7 @@ const updatePaymentSettings = async (req, res) => {
     });
   } catch (error) {
     console.error('Update payment settings error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Failed to update payment settings'
     });
@@ -545,6 +648,11 @@ const updateBankDetails = async (req, res) => {
       });
     }
 
+    const cleanedBankDetails = buildCleanBankDetails(
+      { bank_name, bank_code, account_number, account_name },
+      medicalCenter.facility_name
+    );
+
     const shouldCreateOrRecreateSubaccount =
       !medicalCenter.paystack?.subaccount_code ||
       medicalCenter.paystack?.is_subaccount_active !== true;
@@ -552,28 +660,18 @@ const updateBankDetails = async (req, res) => {
     if (shouldCreateOrRecreateSubaccount) {
       const subaccount = await createPaystackSubaccount({
         business_name: medicalCenter.facility_name,
-        settlement_bank: bank_code,
-        account_number,
+        settlement_bank: cleanedBankDetails.bank_code,
+        account_number: cleanedBankDetails.account_number,
         percentage_charge: 0
       });
 
       medicalCenter.paystack.subaccount_code = subaccount.subaccount_code;
       medicalCenter.paystack.is_subaccount_active = true;
-      medicalCenter.paystack.bank_details = {
-        bank_name,
-        bank_code,
-        account_number,
-        account_name
-      };
+      medicalCenter.paystack.bank_details = cleanedBankDetails;
       medicalCenter.paystack.created_at = medicalCenter.paystack.created_at || new Date();
       medicalCenter.paystack.updated_at = new Date();
     } else {
-      medicalCenter.paystack.bank_details = {
-        bank_name,
-        bank_code,
-        account_number,
-        account_name
-      };
+      medicalCenter.paystack.bank_details = cleanedBankDetails;
       medicalCenter.paystack.updated_at = new Date();
     }
 
@@ -611,9 +709,15 @@ const forgotPasswordMedicalCenter = async (req, res) => {
   try {
     const { email } = req.body;
 
-    const center = await MedicalCenter.findOne({ official_domain_email: email });
+    const center = await MedicalCenter.findOne({
+      official_domain_email: email?.trim().toLowerCase()
+    });
+
     if (!center) {
-      return res.status(200).json({ success: true, message: 'If email exists, reset link sent' });
+      return res.status(200).json({
+        success: true,
+        message: 'If email exists, reset link sent'
+      });
     }
 
     const resetToken = crypto.randomBytes(32).toString('hex');
@@ -621,6 +725,7 @@ const forgotPasswordMedicalCenter = async (req, res) => {
 
     center.resetPasswordToken = hashedToken;
     center.resetPasswordExpire = Date.now() + 120 * 60 * 1000;
+
     await center.save({ validateBeforeSave: false });
 
     const resetUrl = `${process.env.APP_URL}/reset-password/${resetToken}`;
@@ -631,10 +736,16 @@ const forgotPasswordMedicalCenter = async (req, res) => {
       html: `<p>Click to reset password:</p><a href="${resetUrl}">${resetUrl}</a>`
     });
 
-    res.json({ success: true, message: 'Reset email sent' });
+    return res.json({
+      success: true,
+      message: 'Reset email sent'
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, message: 'Email failed' });
+    return res.status(500).json({
+      success: false,
+      message: 'Email failed'
+    });
   }
 };
 
@@ -656,19 +767,29 @@ const resetPasswordMedicalCenter = async (req, res) => {
     }).select('+password');
 
     if (!center) {
-      return res.status(400).json({ success: false, message: 'Token invalid or expired' });
+      return res.status(400).json({
+        success: false,
+        message: 'Token invalid or expired'
+      });
     }
 
     const saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS, 10) || 12;
     center.password = await bcrypt.hash(password, await bcrypt.genSalt(saltRounds));
     center.resetPasswordToken = undefined;
     center.resetPasswordExpire = undefined;
+
     await center.save({ validateBeforeSave: false });
 
-    res.json({ success: true, message: 'Password reset successful' });
+    return res.json({
+      success: true,
+      message: 'Password reset successful'
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, message: 'Reset failed' });
+    return res.status(500).json({
+      success: false,
+      message: 'Reset failed'
+    });
   }
 };
 
@@ -680,7 +801,6 @@ module.exports = {
   loginMedicalCenter,
   getMe,
   getAllMedicalCenters,
-  addPractitioner,
   updateProfile,
   getPaymentSettings,
   updatePaymentSettings,
