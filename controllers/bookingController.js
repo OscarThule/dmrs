@@ -298,20 +298,19 @@ const createPendingAppointment = async (req, res) => {
           amount: totalAmount,
           reference: paymentReference,
           subaccount_code: subaccountCode,
-          metadata: {
-            appointment_id: "pending", // will be replaced after appointment creation
-            patient_id: req.patient._id.toString(),
-            medical_center_id,
-            practitioner_id,
-            slot_id: slot.id,
-            date: dateStr,
-            time: `${slot.start} - ${slot.end}`,
-            reason_for_visit,
-            consultation_type,
-            deposit_amount: depositAmount,
-            platform_fee: platformFee,
-            total_paid: totalAmount
-          }
+         metadata: {
+  patient_id: req.patient._id.toString(),
+  medical_center_id: medical_center_id.toString(),
+  practitioner_id: practitioner_id.toString(),
+  slot_id: slot.id,
+  date: dateStr,
+  time: `${slot.start} - ${slot.end}`,
+  reason_for_visit,
+  consultation_type,
+  deposit_amount: depositAmount,
+  platform_fee: platformFee,
+  total_paid: totalAmount
+}
         });
         paystackAuthorizationUrl = paymentResponse.authorization_url;
       } catch (paystackError) {
@@ -517,61 +516,114 @@ const createPendingAppointment = async (req, res) => {
  * @access  Private (Webhook)
  */
 const confirmAppointmentPayment = async (reference) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const payment = await Payment.findOne({ reference });
-    if (!payment) return;
+    if (!reference) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    if (payment.status === "success") return;
+    const payment = await Payment.findOne({ reference }).session(session);
+    if (!payment) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    const appointment = await Appointment.findById(payment.appointment_id);
-    if (!appointment) return;
+    const appointment = await Appointment.findById(payment.appointment_id).session(session);
+    if (!appointment) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    if (appointment.status !== "pending") return;
+    if (payment.status === "success" && appointment.status === "confirmed") {
+      await session.commitTransaction();
+      session.endSession();
+      return;
+    }
 
-    // Update payment
+    if (appointment.status !== "pending") {
+      await session.commitTransaction();
+      session.endSession();
+      return;
+    }
+
     payment.status = "success";
     payment.metadata = {
       ...payment.metadata,
       confirmed_at: new Date(),
-      confirmed_by: "paystack_webhook",
+      confirmed_by: "paystack"
     };
 
-    // Update appointment
     appointment.status = "confirmed";
     appointment.payment_status = "success";
     appointment.is_paid = true;
     appointment.payment_reference = reference;
     appointment.payment_amount_paid = payment.amount || appointment.total_amount || 0;
 
-    await payment.save();
-    await appointment.save();
+    await payment.save({ session });
+    await appointment.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
   } catch (err) {
-    console.error("Confirm payment error:", err);
+    await session.abortTransaction();
+    session.endSession();
+    console.error("❌ confirmAppointmentPayment error:", err);
   }
 };
 
-/**
- * @desc    Cancel appointment after payment failure (Webhook or scheduled cleanup)
- * @param   {string} reference - Payment reference
- * @param   {string} reason - Failure reason
- */
 const cancelFailedPaymentAppointment = async (reference, reason = "Payment failed") => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    if (!reference) return;
+    if (!reference) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    const payment = await Payment.findOne({ reference });
-    if (!payment) return;
+    const payment = await Payment.findOne({ reference }).session(session);
+    if (!payment) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    // Already processed
-    if (payment.status === "failed") return;
+    const appointment = await Appointment.findById(payment.appointment_id).session(session);
+    if (!appointment) {
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
 
-    const appointment = await Appointment.findById(payment.appointment_id);
-    if (!appointment) return;
+    if (appointment.status === "cancelled") {
+      if (payment.status !== "failed") {
+        payment.status = "failed";
+        payment.metadata = {
+          ...payment.metadata,
+          failed_at: new Date(),
+          failure_reason: reason
+        };
+        await payment.save({ session });
+      }
 
-    // Only clean pending appointments
-    if (appointment.status === "cancelled") return;
+      await session.commitTransaction();
+      session.endSession();
+      return;
+    }
 
-    // 1. Update payment
+    if (appointment.status !== "pending") {
+      await session.commitTransaction();
+      session.endSession();
+      return;
+    }
+
     payment.status = "failed";
     payment.metadata = {
       ...payment.metadata,
@@ -579,7 +631,6 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
       failure_reason: reason
     };
 
-    // 2. Update appointment
     appointment.status = "cancelled";
     appointment.payment_status = "failed";
     appointment.is_paid = false;
@@ -587,14 +638,12 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
     appointment.cancelled_by = "system";
     appointment.cancelled_at = new Date();
     appointment.payment_reference = reference;
+    appointment.payment_amount_paid = 0;
 
-    // 3. Release slot capacity and doctor count atomically
     await RollingSchedule.updateOne(
       {
         _id: appointment.schedule_id,
-        medical_center_id: appointment.medical_center_id,
-        "dailySchedules.date": appointment.date,
-        "dailySchedules.timeSlots.id": appointment.slot_id
+        medical_center_id: appointment.medical_center_id
       },
       {
         $inc: {
@@ -607,18 +656,19 @@ const cancelFailedPaymentAppointment = async (reference, reason = "Payment faile
           { "d.date": appointment.date },
           { "s.id": appointment.slot_id },
           { "doc.doctorId": appointment.practitioner_id }
-        ]
+        ],
+        session
       }
     );
 
-    await payment.save();
-    await appointment.save();
+    await payment.save({ session });
+    await appointment.save({ session });
 
-    // Optional: hard delete unpaid expired bookings
-    if (!appointment.is_paid) {
-      await Appointment.deleteOne({ _id: appointment._id });
-    }
+    await session.commitTransaction();
+    session.endSession();
   } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
     console.error("❌ cancelFailedPaymentAppointment error:", err);
   }
 };
@@ -1418,90 +1468,130 @@ exports.createPayment = async (req, res) => {
   try {
     const { appointment_id } = req.body;
 
-    const appointment = await Appointment.findById(appointment_id).populate("medical_center");
+    if (!appointment_id) {
+      return res.status(400).json({
+        success: false,
+        message: "appointment_id is required"
+      });
+    }
+
+    const appointment = await Appointment.findById(appointment_id).populate("medical_center_id");
     if (!appointment) {
-      return res.status(404).json({ success: false, message: "Appointment not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found"
+      });
+    }
+
+    if (req.patient && appointment.patient_id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized to pay for this appointment"
+      });
     }
 
     if (appointment.status !== "pending") {
       return res.status(400).json({
         success: false,
-        message: "Only pending appointments can be paid",
+        message: "Only pending appointments can be paid"
       });
     }
 
-    const medicalCenter = appointment.medical_center;
+    const medicalCenter = appointment.medical_center_id;
     if (!medicalCenter?.paystack?.subaccount_code) {
       return res.status(400).json({
         success: false,
-        message: "Medical center payment setup incomplete",
+        message: "Medical center payment setup incomplete"
       });
     }
 
     const settings = medicalCenter.paymentSettings || {};
     const depositAmount = Number(settings.bookingDeposit || 0);
 
-    if (!depositAmount || depositAmount <= 0) {
+    if (depositAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: "Booking deposit not set for this medical center",
+        message: "Booking deposit not set for this medical center"
       });
     }
 
-    const percentageFee = depositAmount * 0.1;
-    const finalPlatformFee = Math.max(50, percentageFee);
-    const totalAmount = depositAmount + finalPlatformFee;
+    const platformFee = Math.max(50, depositAmount * 0.1);
+    const totalAmount = depositAmount + platformFee;
 
-    const reference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
-
-    await Payment.create({
-      reference,
-      appointment_id,
-      patient_id: req.patient._id,
-      amount: totalAmount,
-      status: "pending",
-      metadata: {
-        deposit_amount: depositAmount,
-        platform_fee: finalPlatformFee,
-      },
+    let payment = await Payment.findOne({
+      appointment_id: appointment._id,
+      status: "pending"
     });
 
-    await Appointment.findByIdAndUpdate(appointment_id, {
-      payment_reference: reference,
-      payment_status: "pending",
-      is_paid: false,
-    });
+    if (!payment) {
+      const reference = `PAY-${uuidv4().replace(/-/g, "").substring(0, 16)}`;
+
+      payment = await Payment.create({
+        reference,
+        appointment_id: appointment._id,
+        patient_id: req.patient._id,
+        amount: totalAmount,
+        currency: "ZAR",
+        status: "pending",
+        metadata: {
+          appointment_id: appointment._id.toString(),
+          patient_id: req.patient._id.toString(),
+          medical_center_id: medicalCenter._id.toString(),
+          practitioner_id: appointment.practitioner_id?.toString(),
+          slot_id: appointment.slot_id,
+          date: appointment.date,
+          time: `${appointment.slot_start} - ${appointment.slot_end}`,
+          deposit_amount: depositAmount,
+          platform_fee: platformFee,
+          total_paid: totalAmount
+        }
+      });
+
+      appointment.payment_reference = reference;
+      appointment.payment_status = "pending";
+      appointment.is_paid = false;
+      appointment.payment_required = true;
+      await appointment.save();
+    }
 
     const paystackData = await initializeAppointmentPayment({
       email: appointment.patient_email,
       amount: totalAmount,
-      reference,
+      reference: payment.reference,
       subaccount_code: medicalCenter.paystack.subaccount_code,
-      platform_fee: finalPlatformFee,
       metadata: {
-        appointment_id,
-        patient_id: appointment.patient_id,
-        medical_center_id: medicalCenter._id,
+        appointment_id: appointment._id.toString(),
+        patient_id: req.patient._id.toString(),
+        medical_center_id: medicalCenter._id.toString(),
+        practitioner_id: appointment.practitioner_id?.toString(),
+        slot_id: appointment.slot_id,
+        date: appointment.date,
+        time: `${appointment.slot_start} - ${appointment.slot_end}`,
         deposit_amount: depositAmount,
-        platform_fee: finalPlatformFee,
-      },
+        platform_fee: platformFee,
+        total_paid: totalAmount
+      }
     });
 
     return res.status(200).json({
       success: true,
-      authorization_url: paystackData.authorization_url,
-      reference,
-      breakdown: {
-        deposit: depositAmount,
-        platform_fee: finalPlatformFee,
-        total_paid_now: totalAmount,
-      },
+      message: "Payment initialized successfully",
+      data: {
+        reference: payment.reference,
+        authorization_url: paystackData.authorization_url,
+        amount: totalAmount,
+        breakdown: {
+          deposit: depositAmount,
+          platform_fee: platformFee,
+          total_paid_now: totalAmount
+        }
+      }
     });
   } catch (error) {
-    console.error("Payment Init Error:", error);
+    console.error("❌ createPayment error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to initialize payment",
+      message: "Failed to initialize payment"
     });
   }
 };

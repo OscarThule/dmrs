@@ -1,114 +1,102 @@
 const crypto = require("crypto");
 const Payment = require("../models/Payment");
-const Appointment = require("../models/Appointments");
-const { RollingSchedule } = require("../models/editingNextWeek");
+const {
+  confirmAppointmentPayment,
+  cancelFailedPaymentAppointment,
+} = require("../controllers/bookingController");
+
+const SUPPORTED_EVENTS = new Set([
+  "charge.success",
+  "charge.failed",
+]);
+
+const getRawBodyBuffer = (body) => {
+  if (Buffer.isBuffer(body)) return body;
+  if (typeof body === "string") return Buffer.from(body, "utf8");
+  return Buffer.from(JSON.stringify(body || {}), "utf8");
+};
 
 exports.handleWebhook = async (req, res) => {
-  console.log("🔥 PAYSTACK WEBHOOK HIT");
-  console.log("Headers:", req.headers);
-  console.log("Raw body:", req.body.toString());
-
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     const signature = req.headers["x-paystack-signature"];
 
-    const hash = crypto
-      .createHmac("sha512", secret)
-      .update(req.body)
-      .digest("hex");
+    if (!secret) {
+      console.error("❌ PAYSTACK_SECRET_KEY is missing");
+      return res.sendStatus(500);
+    }
 
-    if (hash !== signature) {
-      console.log("❌ Signature mismatch");
+    if (!signature) {
+      console.warn("❌ Missing x-paystack-signature header");
       return res.sendStatus(401);
     }
 
-    const event = JSON.parse(req.body.toString());
-    const reference = event?.data?.reference;
-    if (!reference) return res.sendStatus(200);
+    const rawBody = getRawBodyBuffer(req.body);
 
-    const payment = await Payment.findOne({ reference });
-    if (!payment) return res.sendStatus(200);
+    const expectedSignature = crypto
+      .createHmac("sha512", secret)
+      .update(rawBody)
+      .digest("hex");
 
-    const appointment = await Appointment.findById(payment.appointment_id);
-    if (!appointment) return res.sendStatus(200);
-
-    // ===== SUCCESS =====
-    if (event.event === "charge.success") {
-      if (payment.status !== "success" && appointment.status === "pending") {
-        payment.status = "success";
-
-        appointment.status = "confirmed";
-        appointment.payment_status = "success";
-        appointment.is_paid = true;
-        appointment.payment_reference = reference;
-
-        await payment.save();
-        await appointment.save();
-
-        console.log("🎉 Appointment confirmed");
-      }
+    if (expectedSignature !== signature) {
+      console.warn("❌ Invalid Paystack webhook signature");
+      return res.sendStatus(401);
     }
 
-    // ===== FAILED =====
-    if (event.event === "charge.failed") {
-      if (appointment.status === "pending") {
-        payment.status = "failed";
+    let event;
 
-        appointment.status = "cancelled";
-        appointment.payment_status = "failed";
-        appointment.is_paid = false;
-        appointment.payment_reference = reference;
-        appointment.cancellation_reason =
-          event.data.gateway_response || "Payment failed";
-        appointment.cancelled_by = "system";
-        appointment.cancelled_at = new Date();
+    try {
+      event = JSON.parse(rawBody.toString("utf8"));
+    } catch (parseError) {
+      console.error("❌ Failed to parse Paystack webhook JSON:", parseError);
+      return res.sendStatus(400);
+    }
 
-        const schedule = await RollingSchedule.findById(
-          appointment.schedule_id
-        );
+    const eventName = event?.event;
+    const reference = event?.data?.reference;
 
-        if (schedule) {
-          const dateStr = appointment.date.toISOString().split("T")[0];
-          const day = schedule.dailySchedules.find(
-            (d) => new Date(d.date).toISOString().split("T")[0] === dateStr
-          );
+    console.log("🔥 PAYSTACK WEBHOOK HIT:", {
+      event: eventName,
+      reference,
+    });
 
-          if (day) {
-            const slot = day.timeSlots.find(
-              (s) => s.id === appointment.slot_id
-            );
+    if (!eventName || !reference) {
+      console.warn("⚠️ Webhook missing event name or reference");
+      return res.sendStatus(200);
+    }
 
-            if (slot) {
-              slot.availableCapacity += 1;
+    if (!SUPPORTED_EVENTS.has(eventName)) {
+      console.log(`ℹ️ Ignoring unsupported Paystack event: ${eventName}`);
+      return res.sendStatus(200);
+    }
 
-              const doctor = slot.assignedDoctors.find(
-                (d) =>
-                  d.doctorId?.toString() ===
-                  appointment.practitioner_id.toString()
-              );
+    const payment = await Payment.findOne({ reference }).select("_id reference status appointment_id");
 
-              if (doctor) {
-                doctor.currentPatients = Math.max(
-                  0,
-                  (doctor.currentPatients || 1) - 1
-                );
-              }
-            }
-          }
+    if (!payment) {
+      console.warn(`⚠️ No payment found for reference: ${reference}`);
+      return res.sendStatus(200);
+    }
 
-          await schedule.save();
-        }
+    if (eventName === "charge.success") {
+      await confirmAppointmentPayment(reference);
+      console.log(`✅ Appointment/payment confirmed for reference: ${reference}`);
+      return res.sendStatus(200);
+    }
 
-        await payment.save();
-        await appointment.save();
+    if (eventName === "charge.failed") {
+      const failureReason =
+        event?.data?.gateway_response ||
+        event?.data?.status ||
+        "Payment failed";
 
-        console.log("♻️ Appointment cancelled and slot released");
-      }
+      await cancelFailedPaymentAppointment(reference, failureReason);
+      console.log(`♻️ Appointment/payment cancelled for reference: ${reference}`);
+      return res.sendStatus(200);
     }
 
     return res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
+  } catch (error) {
+    console.error("❌ Paystack webhook error:", error);
     return res.sendStatus(500);
   }
 };
