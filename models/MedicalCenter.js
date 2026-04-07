@@ -62,32 +62,43 @@ const paymentSettingsSchema = new mongoose.Schema({
 // Practitioner Schema
 // -----------------------
 const practitionerSchema = new mongoose.Schema({
-  practitioner_id: { type: String, default: uuidv4, unique: true },
-  full_name: { type: String, required: true },
-  role: { 
-    type: String, 
-    enum: ['doctor', 'nurse', 'clinical_manager', 'admin', 'receptionist', 'technician'],
-    required: true 
+  practitioner_id: { type: String, default: uuidv4 },
+
+  full_name: { type: String, default: '', trim: true },
+
+  role: {
+    type: String,
+    enum: ['doctor', 'nurse', 'clinical_manager', 'admin', 'receptionist', 'technician', ''],
+    default: ''
   },
-  professional_license_number: String,
+
+  professional_license_number: { type: String, default: '', trim: true },
+
   license_type: {
     type: String,
     enum: ['HPCSA', 'SANC', 'other'],
     default: 'HPCSA'
   },
-  license_doc_url: String,
-  contact_email: { type: String, required: true },
-  contact_phone: String,
+
+  license_doc_url: { type: String, default: '', trim: true },
+
+  contact_email: { type: String, default: '', trim: true },
+
+  contact_phone: { type: String, default: '', trim: true },
+
   verification_status: {
     type: String,
     enum: ['unverified', 'pending', 'verified', 'rejected'],
     default: 'unverified'
   },
+
   is_active: { type: Boolean, default: true },
-  specialties: [String],
+
+  specialties: { type: [String], default: [] },
+
   added_at: { type: Date, default: Date.now },
   last_updated: { type: Date, default: Date.now }
-});
+}, { _id: true });
 
 // -----------------------
 // Operational Hours Schema

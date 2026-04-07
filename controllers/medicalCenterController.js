@@ -267,8 +267,10 @@ const loginMedicalCenter = async (req, res) => {
       });
     }
 
-    medicalCenter.last_login = new Date();
-    await medicalCenter.save();
+   await MedicalCenter.updateOne(
+  { _id: medicalCenter._id },
+  { $set: { last_login: new Date() } }
+);
 
     const token = generateToken(medicalCenter._id);
 
